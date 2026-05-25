@@ -2,3 +2,5 @@
 .gemini/
 .cline/
 *.stackdump
+.env
+INSTALL_INFO.txt
