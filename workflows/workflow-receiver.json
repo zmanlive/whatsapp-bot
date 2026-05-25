@@ -1,33 +1,141 @@
 {
   "name": "WA Bot - Receiver",
   "active": true,
-  "settings": { "executionOrder": "v1" },
+  "settings": {
+    "executionOrder": "v1"
+  },
   "nodes": [
     {
       "id": "n_wh",
       "name": "Webhook WAHA",
       "type": "n8n-nodes-base.webhook",
       "typeVersion": 1.1,
-      "position": [100, 300],
-      "parameters": { "path": "waha", "responseMode": "onReceived", "options": {} }
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {
+        "path": "waha",
+        "responseMode": "onReceived",
+        "options": {}
+      }
     },
     {
       "id": "n_init",
       "name": "Init Security",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [300, 300],
-      "parameters": { "jsCode": "const body=($input.first().json?.body??$input.first().json)??{};const msgId=body.id??body.key?.id??('_'+Date.now());const from=(body.from??body.key?.remoteJid??'').replace('@s.whatsapp.net','');const isAudio=['audio','ptt','voice'].includes(body.type??'');const msgType=isAudio?'audio':'text';const rawText=(body.body??body.message?.conversation??'').trim();const msgText=rawText.toLowerCase();const sd=$getWorkflowStaticData('global');sd.processedIds=sd.processedIds??{};sd.utilisateurs=sd.utilisateurs??{};sd.messages=sd.messages??[];sd.config={numeroAutorise:sd.config?.numeroAutorise??process.env.AUTHORIZED_NUMBER??'',nomDefaut:sd.config?.nomDefaut??process.env.BOT_NAME??'',premessageDefaut:sd.config?.premessageDefaut??process.env.DEFAULT_PREMESSAGE??'',timezone:sd.config?.timezone??process.env.TZ??'UTC'};const now=Date.now();Object.keys(sd.processedIds).forEach(k=>{if(now-sd.processedIds[k]>3600000)delete sd.processedIds[k];});if(sd.processedIds[msgId])return[];sd.processedIds[msgId]=now;if(!from||from!==sd.config.numeroAutorise)return[];sd.utilisateurs[from]??={langue:'en',etape:0,previousEtape:null,pendingCmd:null,lastActivity:now,flux:{}};const user=sd.utilisateurs[from];if(user.etape>0&&(now-(user.lastActivity??0))>30*60*1000){user.etape=0;user.flux={};user.previousEtape=null;user.pendingCmd=null;user.lastActivity=now;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:'Flow cancelled (30 min inactive).'}}];}user.lastActivity=now;sd.utilisateurs[from]=user;return[{json:{from,msgType,msgText,rawText,msgId,rawBody:body,user,sd}}];" }
+      "position": [
+        300,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const body = ($input.first().json?.body ?? $input.first().json) ?? {};\nconst msgId = body.id ?? body.key?.id ?? ('_' + Date.now());\nconst from = (body.from ?? body.key?.remoteJid ?? '').replace('@s.whatsapp.net', '');\nconst isAudio = ['audio', 'ptt', 'voice'].includes(body.type ?? '');\nconst msgType = isAudio ? 'audio' : 'text';\nconst rawText = (body.body ?? body.message?.conversation ?? '').trim();\nconst msgText = rawText.toLowerCase();\n\nconst AUTHORIZED = process.env.AUTHORIZED_NUMBER ?? '';\nif (!from || from !== AUTHORIZED) return [];\n\n// Dedup: ephemeral, kept in static data (loss on restart is acceptable)\nconst sd = $getWorkflowStaticData('global');\nsd.processedIds = sd.processedIds ?? {};\nconst now = Date.now();\nObject.keys(sd.processedIds).forEach(k => {\n  if (now - sd.processedIds[k] > 3600000) delete sd.processedIds[k];\n});\nif (sd.processedIds[msgId]) return [];\nsd.processedIds[msgId] = now;\n\nreturn [{ json: { from, msgType, msgText, rawText, msgId, rawBody: body } }];\n"
+      }
+    },
+    {
+      "id": "n_pgu",
+      "name": "PG Read User State",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM bot_user_state WHERE phone = $1",
+        "options": {
+          "queryReplacement": "={{ [$json.from] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "n_mc",
+      "name": "Merge Context",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        700,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const init = $('Init Security').first().json;\nconst pgRows = $input.all();\nconst now = Date.now();\nconst from = init.from;\n\nconst row = pgRows[0]?.json ?? null;\nlet user;\n\nif (row && row.phone) {\n  const flags = (row.flags && typeof row.flags === 'object') ? row.flags : {};\n  user = {\n    etape:          row.step ?? 0,\n    flux:           (row.draft && typeof row.draft === 'object') ? row.draft : {},\n    previousEtape:  flags.previousEtape  ?? null,\n    pendingCmd:     flags.pendingCmd     ?? null,\n    pendingCancelId:flags.pendingCancelId?? null,\n    pendingCancelAll:flags.pendingCancelAll ?? false,\n    editingMsgId:   flags.editingMsgId   ?? null,\n    editingField:   flags.editingField   ?? null,\n    editingDateVal: flags.editingDateVal ?? null,\n    lastActivity:   row.last_activity ? new Date(row.last_activity).getTime() : now\n  };\n} else {\n  user = {\n    etape: 0, flux: {}, previousEtape: null, pendingCmd: null,\n    pendingCancelId: null, pendingCancelAll: false,\n    editingMsgId: null, editingField: null, editingDateVal: null,\n    lastActivity: now\n  };\n}\n\nconst toDbUser = (u) => ({\n  phone: from,\n  step:  u.etape,\n  draft: u.flux ?? {},\n  flags: {\n    previousEtape:   u.previousEtape,\n    pendingCmd:      u.pendingCmd,\n    pendingCancelId: u.pendingCancelId,\n    pendingCancelAll:u.pendingCancelAll,\n    editingMsgId:    u.editingMsgId,\n    editingField:    u.editingField,\n    editingDateVal:  u.editingDateVal\n  }\n});\n\nif (user.etape > 0 && (now - user.lastActivity) > 30 * 60 * 1000) {\n  user.etape = 0; user.flux = {}; user.previousEtape = null; user.pendingCmd = null;\n  return [{ json: {\n    ...init, user, _early_exit: true,\n    action: 'send', to: from, text: 'Flow cancelled (30 min inactive).',\n    _db_user: toDbUser(user)\n  }}];\n}\n\nuser.lastActivity = now;\nreturn [{ json: { ...init, user, _early_exit: false } }];\n"
+      }
     },
     {
       "id": "n_sw",
-      "name": "Switch Type",
+      "name": "Switch Entry",
       "type": "n8n-nodes-base.switch",
       "typeVersion": 3,
-      "position": [500, 300],
+      "position": [
+        900,
+        300
+      ],
       "parameters": {
         "mode": "expression",
-        "output": "={{ ['audio','ptt','voice'].includes($json.msgType) ? 0 : 1 }}"
+        "output": "={{ $json._early_exit ? 0 : (['audio','ptt','voice'].includes($json.msgType) ? 1 : 2) }}"
+      }
+    },
+    {
+      "id": "n_pge",
+      "name": "PG Save User Early",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        140
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO bot_user_state (phone, step, draft, flags, last_activity) VALUES ($1,$2,$3::jsonb,$4::jsonb,NOW()) ON CONFLICT (phone) DO UPDATE SET step=EXCLUDED.step, draft=EXCLUDED.draft, flags=EXCLUDED.flags, last_activity=NOW()",
+        "options": {
+          "queryReplacement": "={{ [$json._db_user.phone, $json._db_user.step, JSON.stringify($json._db_user.draft), JSON.stringify($json._db_user.flags)] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "n_sr_early",
+      "name": "Send Response Early",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1300,
+        140
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://waha:3000/api/default/sendText",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.WAHA_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"chatId\":\"{{$('Merge Context').first().json.to}}@s.whatsapp.net\",\"text\":\"{{$('Merge Context').first().json.text}}\"}",
+        "options": {
+          "timeout": 15000
+        },
+        "continueOnFail": true
       }
     },
     {
@@ -35,21 +143,43 @@
       "name": "Audio Handler",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [700, 160],
-      "parameters": { "jsCode": "const{from,user,sd,rawBody}=$json;const fs=rawBody?.message?.audioMessage?.fileLength??0;const dur=rawBody?.message?.audioMessage?.seconds??0;const mUrl=$('Webhook WAHA').first().json?.payload?.media?.url??'';const mId=rawBody?.id??'';if(fs>25*1024*1024)return[{json:{action:'send',to:from,text:'Audio too large (max 25MB).'}}];if(dur>300)return[{json:{action:'send',to:from,text:'Audio too long (max 5 min).'}}];if(!mUrl)return[{json:{action:'send',to:from,text:'Audio unavailable. Try again.'}}];return[{json:{action:'transcribe',from,user,sd,mediaUrl:mUrl,mediaId:mId,etape:user.etape}}];" }
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const { from, user, rawBody } = $json;\nconst fs  = rawBody?.message?.audioMessage?.fileLength ?? 0;\nconst dur = rawBody?.message?.audioMessage?.seconds ?? 0;\nconst mUrl = $('Webhook WAHA').first().json?.payload?.media?.url ?? '';\nconst mId  = rawBody?.id ?? '';\n\nif (fs > 25 * 1024 * 1024)\n  return [{ json: { action: 'send', to: from, text: 'Audio too large (max 25MB).', _db_user: null } }];\nif (dur > 300)\n  return [{ json: { action: 'send', to: from, text: 'Audio too long (max 5 min).', _db_user: null } }];\nif (!mUrl)\n  return [{ json: { action: 'send', to: from, text: 'Audio unavailable. Try again.', _db_user: null } }];\n\nreturn [{ json: { action: 'transcribe', from, user, mediaUrl: mUrl, mediaId: mId, etape: user.etape } }];\n"
+      }
     },
     {
       "id": "n_dl",
       "name": "Download Audio",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.4,
-      "position": [900, 160],
+      "position": [
+        1300,
+        300
+      ],
       "parameters": {
         "method": "GET",
         "url": "={{ $('Audio Handler').first().json.mediaUrl }}",
         "sendHeaders": true,
-        "headerParameters": { "parameters": [{ "name": "X-Api-Key", "value": "={{$env.WAHA_API_KEY}}" }] },
-        "options": { "response": { "response": { "responseFormat": "file" } }, "timeout": 15000 }
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.WAHA_API_KEY}}"
+            }
+          ]
+        },
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "file"
+            }
+          },
+          "timeout": 15000
+        }
       }
     },
     {
@@ -57,22 +187,32 @@
       "name": "Extract Base64",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1100, 160],
-      "parameters": { "jsCode": "const audioBase64=$input.first().binary.data.data;return[{json:{audioBase64}}];" }
+      "position": [
+        1500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const audioBase64 = $input.first().binary.data.data; return [{ json: { audioBase64 } }];"
+      }
     },
     {
       "id": "n_gm",
       "name": "Gemini Transcribe",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4.2,
-      "position": [1300, 160],
+      "position": [
+        1700,
+        300
+      ],
       "parameters": {
         "method": "POST",
         "url": "=https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={{$env.GEMINI_API_KEY}}",
         "sendBody": true,
         "specifyBody": "json",
         "jsonBody": "={{ JSON.stringify({contents:[{parts:[{inline_data:{mime_type:'audio/ogg',data:$json.audioBase64}},{text:'Transcribe this audio to text. Return only the transcribed text.'}]}]}) }}",
-        "options": { "timeout": 30000 }
+        "options": {
+          "timeout": 30000
+        }
       }
     },
     {
@@ -80,13 +220,25 @@
       "name": "Delete Audio",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [1500, 160],
+      "position": [
+        1900,
+        300
+      ],
       "parameters": {
         "method": "DELETE",
         "url": "=http://waha:3000/api/default/media/{{$('Audio Handler').first().json.mediaId}}",
         "sendHeaders": true,
-        "headerParameters": { "parameters": [{ "name": "X-Api-Key", "value": "={{$env.WAHA_API_KEY}}" }] },
-        "options": { "timeout": 5000 },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.WAHA_API_KEY}}"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 5000
+        },
         "continueOnFail": true
       }
     },
@@ -95,58 +247,518 @@
       "name": "Gemini Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1700, 160],
-      "parameters": { "jsCode": "const resp=$('Gemini Transcribe').first().json??{};const{from,user,sd,etape}=$('Audio Handler').first().json;const err=resp?.error?.code;if(err){let m='Transcription failed.';if(err===429)m='Gemini quota exceeded. Try again in a few minutes.';else if(err===400)m='Audio unreadable by Gemini.';else if(err===403)m='Invalid Gemini key.';return[{json:{action:'send',to:from,text:m}}];}const t=resp?.candidates?.[0]?.content?.parts?.[0]?.text?.trim()??'';if(!t)return[{json:{action:'send',to:from,text:'Empty transcription.'}}];if(etape===0)return[{json:{action:'send',to:from,text:'\\uD83C\\uDF04 '+t}}];user.flux.pendingTranscription=t;sd.utilisateurs[from]=user;const fl=user.flux;return[{json:{action:'send',to:from,text:'\\uD83C\\uDF04 '+t+'\\n\\nUse as message?\\n\\uD83D\\uDCCD '+fl.destinataire+'  '+fl.scheduledLocal+'\\nyes / no'}}];" }
+      "position": [
+        2100,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const resp = $('Gemini Transcribe').first().json ?? {};\nconst { from, user } = $('Audio Handler').first().json;\nconst etape = $('Audio Handler').first().json.etape;\n\nconst toDbUser = (u) => ({\n  phone: from,\n  step:  u.etape,\n  draft: u.flux ?? {},\n  flags: {\n    previousEtape:   u.previousEtape,\n    pendingCmd:      u.pendingCmd,\n    pendingCancelId: u.pendingCancelId,\n    pendingCancelAll:u.pendingCancelAll,\n    editingMsgId:    u.editingMsgId,\n    editingField:    u.editingField,\n    editingDateVal:  u.editingDateVal\n  }\n});\n\nconst err = resp?.error?.code;\nif (err) {\n  let m = 'Transcription failed.';\n  if (err === 429) m = 'Gemini quota exceeded. Try again in a few minutes.';\n  else if (err === 400) m = 'Audio unreadable by Gemini.';\n  else if (err === 403) m = 'Invalid Gemini key.';\n  return [{ json: { action: 'send', to: from, text: m, _db_user: toDbUser(user) } }];\n}\n\nconst t = resp?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() ?? '';\nif (!t) return [{ json: { action: 'send', to: from, text: 'Empty transcription.', _db_user: toDbUser(user) } }];\n\nif (etape === 0) return [{ json: { action: 'send', to: from, text: '🎤 ' + t, _db_user: toDbUser(user) } }];\n\nuser.flux.pendingTranscription = t;\nconst fl = user.flux;\nreturn [{\n  json: {\n    action: 'send', to: from,\n    text: '🎤 ' + t + '\\n\\nUse as message?\\n📍 ' + fl.destinataire + '  ' + fl.scheduledLocal + '\\nyes / no',\n    _db_user: toDbUser(user)\n  }\n}];\n"
+      }
+    },
+    {
+      "id": "n_pgua",
+      "name": "PG Save User Audio",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2300,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO bot_user_state (phone, step, draft, flags, last_activity) VALUES ($1,$2,$3::jsonb,$4::jsonb,NOW()) ON CONFLICT (phone) DO UPDATE SET step=EXCLUDED.step, draft=EXCLUDED.draft, flags=EXCLUDED.flags, last_activity=NOW()",
+        "options": {
+          "queryReplacement": "={{ [$('Gemini Result').first().json._db_user.phone, $('Gemini Result').first().json._db_user.step, JSON.stringify($('Gemini Result').first().json._db_user.draft), JSON.stringify($('Gemini Result').first().json._db_user.flags)] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "n_sr_audio",
+      "name": "Send Response Audio",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        2500,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://waha:3000/api/default/sendText",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.WAHA_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"chatId\":\"{{$('Gemini Result').first().json.to}}@s.whatsapp.net\",\"text\":\"{{$('Gemini Result').first().json.text}}\"}",
+        "options": {
+          "timeout": 15000
+        },
+        "continueOnFail": true
+      }
     },
     {
       "id": "n_th",
       "name": "Text Handler",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [700, 420],
-      "parameters": { "jsCode": "let{from,msgText,rawText,user,sd}=$json;const isSlash=msgText.startsWith('/');const cmd=isSlash?msgText.split(' ')[0]:null;const cmdArg=isSlash?(parseInt(msgText.split(' ')[1])||null):null;const mc=(t)=>isSlash&&cmd===t;if(user.etape>0&&user.etape!==99&&isSlash){user.previousEtape=user.etape;user.etape=99;user.pendingCmd=msgText;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:'Flow in progress. Abandon?\\nyes / no'}}];}if(user.etape===99){const ok=msgText==='yes';if(ok){msgText=user.pendingCmd;user.etape=0;user.flux={};user.pendingCmd=null;user.previousEtape=null;sd.utilisateurs[from]=user;}else{user.etape=user.previousEtape??0;user.previousEtape=null;user.pendingCmd=null;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:'OK, continuing.'}}];}}if(mc('/list'))return[{json:{action:'crud_liste',from,sd}}];if(mc('/view'))return[{json:{action:'crud_voir',from,sd,n:cmdArg}}];if(mc('/edit'))return[{json:{action:'crud_edit',from,sd,n:cmdArg}}];if(mc('/help'))return[{json:{action:'aide',from}}];if(mc('/cancel')&&msgText.includes('all'))return[{json:{action:'crud_cancel_all',from,sd}}];if(mc('/cancel'))return[{json:{action:'crud_cancel',from,sd,n:cmdArg}}];return[{json:{action:'flux',from,rawText,msgText,user,sd}}];" }
+      "position": [
+        1100,
+        460
+      ],
+      "parameters": {
+        "jsCode": "let { from, msgText, rawText, user } = $json;\n\nconst toDbUser = (u) => ({\n  phone: from,\n  step:  u.etape,\n  draft: u.flux ?? {},\n  flags: {\n    previousEtape:   u.previousEtape,\n    pendingCmd:      u.pendingCmd,\n    pendingCancelId: u.pendingCancelId,\n    pendingCancelAll:u.pendingCancelAll,\n    editingMsgId:    u.editingMsgId,\n    editingField:    u.editingField,\n    editingDateVal:  u.editingDateVal\n  }\n});\n\nconst send = (text) => [{ json: { action: 'send', to: from, text, _db_user: toDbUser(user) } }];\n\nconst isSlash = msgText.startsWith('/');\nconst cmd = isSlash ? msgText.split(' ')[0] : null;\nconst cmdArg = isSlash ? (parseInt(msgText.split(' ')[1]) || null) : null;\nconst mc = (t) => isSlash && cmd === t;\n\nif (user.etape > 0 && user.etape !== 99 && isSlash) {\n  user.previousEtape = user.etape; user.etape = 99; user.pendingCmd = msgText;\n  return send('Flow in progress. Abandon?\\nyes / no');\n}\n\nif (user.etape === 99) {\n  const ok = msgText === 'yes';\n  if (ok) {\n    msgText = user.pendingCmd;\n    user.etape = 0; user.flux = {}; user.pendingCmd = null; user.previousEtape = null;\n  } else {\n    user.etape = user.previousEtape ?? 0; user.previousEtape = null; user.pendingCmd = null;\n    return send('OK, continuing.');\n  }\n}\n\nconst fwd = (action, extra = {}) => [{ json: { action, from, rawText, msgText, user, n: cmdArg, ...extra } }];\n\nif (mc('/list'))   return fwd('crud_liste');\nif (mc('/view'))   return fwd('crud_voir');\nif (mc('/edit'))   return fwd('crud_edit');\nif (mc('/help'))   return fwd('aide');\nif (mc('/cancel') && msgText.includes('all')) return fwd('crud_cancel_all');\nif (mc('/cancel')) return fwd('crud_cancel');\nreturn fwd('flux');\n"
+      }
+    },
+    {
+      "id": "n_sw2",
+      "name": "Switch Text",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [
+        1300,
+        460
+      ],
+      "parameters": {
+        "mode": "expression",
+        "output": "={{ $json.action === 'send' ? 0 : 1 }}"
+      }
+    },
+    {
+      "id": "n_pgut",
+      "name": "PG Save User Text Early",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1500,
+        380
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO bot_user_state (phone, step, draft, flags, last_activity) VALUES ($1,$2,$3::jsonb,$4::jsonb,NOW()) ON CONFLICT (phone) DO UPDATE SET step=EXCLUDED.step, draft=EXCLUDED.draft, flags=EXCLUDED.flags, last_activity=NOW()",
+        "options": {
+          "queryReplacement": "={{ [$json._db_user.phone, $json._db_user.step, JSON.stringify($json._db_user.draft), JSON.stringify($json._db_user.flags)] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "n_sr_tearly",
+      "name": "Send Response Text Early",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4,
+      "position": [
+        1700,
+        380
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://waha:3000/api/default/sendText",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.WAHA_API_KEY}}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"chatId\":\"{{$('Text Handler').first().json.to}}@s.whatsapp.net\",\"text\":\"{{$('Text Handler').first().json.text}}\"}",
+        "options": {
+          "timeout": 15000
+        },
+        "continueOnFail": true
+      }
+    },
+    {
+      "id": "n_pgm",
+      "name": "PG Read Messages",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1500,
+        560
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT * FROM bot_messages WHERE owner = $1 ORDER BY scheduled_at DESC LIMIT 200",
+        "options": {
+          "queryReplacement": "={{ [$json.from] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      },
+      "continueOnFail": true
     },
     {
       "id": "n_fc",
       "name": "Flux CRUD Handler",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [1000, 420],
-      "parameters": { "jsCode": "const{action,from,rawText,msgText,user,sd,n}=$json;const fl=user?.flux??{};const TZ=sd.config?.timezone??'UTC';const{DateTime}=require('luxon');const M={askDate:'Number ok. Send date (ex: 20/05/2026)',askTime:'Date ok. Send time (ex: 14:30)',askMsg:'Time ok. Send your message (text or voice note)',askPre:'Message received.\\n1=Default pre-message\\n2=None\\n3=Custom',askCustom:'Write your pre-message:',confirm:(f)=>'Confirm?\\n\\uD83D\\uDCCD '+f.destinataire+'\\n\\uD83D\\uDD52 '+f.scheduledLocal+'\\n\\uD83D\\uDCAC \"'+f.message+'\"\\n\\nyes / no',saved:(id)=>'Scheduled! Ref: '+id+'\\n/list to view',badNum:'Invalid number. Ex: 33612345678',badDate:'Invalid or past date. Ex: 20/05/2026',badTime:'Invalid or past time. Ex: 14:30',badPre:'Reply 1, 2 or 3',warnNone:'Recipient will receive the message without any context.',cancelled:'Flow cancelled.',noMsgs:'No scheduled messages.',notFound:'Message not found.',notCancel:'Message already sent.',deleted:'Message deleted.',deletedAll:'All messages deleted.',confirmDel:(id)=>'Delete '+id+'?\\nyes / no',confirmDelAll:'Delete ALL messages?\\nyes / no',editMenu:'What to edit?\\n1=Number 2=Date 3=Time 4=Message 5=Pre-message',help:'Commands: /list  /view [n]  /edit [n]  /cancel [n]  /help\\n\\nSchedule a message:\\n  Send the recipient number, then follow the prompts:\\n  \\u2192 date (ex: 25/05/2026)\\n  \\u2192 time (ex: 14:30)\\n  \\u2192 your message (text or voice note)\\n  \\u2192 pre-message (1=default  2=none  3=custom)\\n  \\u2192 confirm with yes\\n\\n  Shortcut \\u2014 send all at once:\\n  33612345678\\n  25/05/2026\\n  14:30\\n  Your message here\\n\\nVoice notes \\u2192 instant transcription by Gemini.\\nTimeout: 30 min of inactivity resets the flow.'};function pd(s){if(/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(s))return DateTime.fromFormat(s,'dd/MM/yyyy',{zone:TZ});if(/^\\d{4}-\\d{2}-\\d{2}$/.test(s))return DateTime.fromFormat(s,'yyyy-MM-dd',{zone:TZ});return null;}function vd(s){const d=pd(s);return d?.isValid&&d>=DateTime.now().setZone(TZ).startOf('day');}function vdt(ds,ts){const d=pd(ds);if(!d?.isValid)return false;const[h,m]=ts.split(':').map(Number);if(isNaN(h)||isNaN(m)||h>23||m>59)return false;return d.set({hour:h,minute:m})>DateTime.now().setZone(TZ);}function toSched(ds,ts){const d=pd(ds);const[h,m]=ts.split(':').map(Number);const full=d.set({hour:h,minute:m,second:0});return{utc:full.toUTC().toISO(),local:full.toFormat('dd/MM/yyyy')+' at '+ts+' ('+TZ+')'};}const isOui=msgText==='yes';const isNon=msgText==='no';if(action==='aide')return[{json:{action:'send',to:from,text:M.help}}];if(action==='crud_liste'){const ms=(sd.messages??[]).filter(m=>['pending','sending'].includes(m.status));if(!ms.length)return[{json:{action:'send',to:from,text:M.noMsgs}}];const list=ms.map((m,i)=>'#'+(i+1)+' '+m.id.substring(0,18)+'\\n '+m.destinataire+' | \\uD83D\\uDD52 '+m.scheduledLocal+' | '+m.status).join('\\n\\n');return[{json:{action:'send',to:from,text:'\\uD83D\\uDCCB '+list+'\\n\\n/view /edit /cancel'}}];}if(action==='crud_voir'){const msg=(sd.messages??[]).find(m=>n?m.id.includes(String(n)):false);if(!msg)return[{json:{action:'send',to:from,text:M.notFound}}];return[{json:{action:'send',to:from,text:'\\uD83D\\uDCCB '+msg.id+'\\n\\uD83D\\uDCCD '+msg.destinataire+'\\n\\uD83D\\uDD52 '+msg.scheduledLocal+'\\n\\uD83D\\uDCAC \"'+msg.message+'\"\\nStatus: '+msg.status}}];}if(action==='crud_cancel'){const msg=(sd.messages??[]).find(m=>n?m.id.includes(String(n)):false);if(!msg)return[{json:{action:'send',to:from,text:M.notFound}}];if(msg.status==='sent')return[{json:{action:'send',to:from,text:M.notCancel}}];user.pendingCancelId=msg.id;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.confirmDel(msg.id.substring(0,18))}}];}if(action==='crud_cancel_all'){user.pendingCancelAll=true;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.confirmDelAll}}];}if(action==='crud_edit'){const msg=(sd.messages??[]).find(m=>n?m.id.includes(String(n)):false);if(!msg)return[{json:{action:'send',to:from,text:M.notFound}}];user.editingMsgId=msg.id;user.editingField=null;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.editMenu}}];}if(user.pendingCancelId&&(isOui||isNon)){const cid=user.pendingCancelId;user.pendingCancelId=null;sd.utilisateurs[from]=user;if(isOui){const msg=(sd.messages??[]).find(m=>m.id===cid);if(msg){msg.status='cancelled';msg.updatedAt=new Date().toISOString();}return[{json:{action:'send',to:from,text:M.deleted}}];}return[{json:{action:'send',to:from,text:'OK.'}}];}if(user.pendingCancelAll&&(isOui||isNon)){user.pendingCancelAll=false;sd.utilisateurs[from]=user;if(isOui){(sd.messages??[]).forEach(m=>{if(['pending','sending'].includes(m.status)){m.status='cancelled';m.updatedAt=new Date().toISOString();}});return[{json:{action:'send',to:from,text:M.deletedAll}}];}return[{json:{action:'send',to:from,text:'OK.'}}];}if(user.editingMsgId&&!user.editingField){const choice=parseInt(msgText);if([1,2,3,4,5].includes(choice)){user.editingField=['destinataire','date','heure','message','premessageType'][choice-1];sd.utilisateurs[from]=user;const ask=['New number:','New date (ex: 20/05/2026):','New time (ex: 14:30):','New message:','Pre-message (1=default 2=none 3=custom):'][choice-1];return[{json:{action:'send',to:from,text:ask}}];}user.editingMsgId=null;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:'Cancelled.'}}];}if(user.editingMsgId&&user.editingField){const msg=(sd.messages??[]).find(m=>m.id===user.editingMsgId);if(msg){const f=user.editingField;if(f==='destinataire'){if(!/^[0-9]{8,15}$/.test(rawText))return[{json:{action:'send',to:from,text:M.badNum}}];msg.destinataire=rawText;}else if(f==='date'){if(!vd(rawText))return[{json:{action:'send',to:from,text:M.badDate}}];msg.date=rawText;}else if(f==='heure'){if(!vdt(msg.date??msg.scheduledLocal,rawText))return[{json:{action:'send',to:from,text:M.badTime}}];const sc=toSched(msg.date??msg.scheduledLocal.split(' ')[0],rawText);msg.scheduledAtUtc=sc.utc;msg.scheduledLocal=sc.local;msg.heure=rawText;}else if(f==='message'){msg.message=rawText;}else if(f==='premessageType'){if(msgText==='1')msg.premessageType='default';else if(msgText==='2')msg.premessageType='none';else if(msgText==='3')msg.premessageType='custom';}msg.updatedAt=new Date().toISOString();}user.editingMsgId=null;user.editingField=null;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:'Modified!'}}];}if(user.etape===0){const lines=rawText.split('\\n').map(s=>s.trim()).filter(Boolean);if(lines.length>=4){const[num,ds,ts,...mp]=lines;if(!/^[0-9]{8,15}$/.test(num))return[{json:{action:'send',to:from,text:M.badNum}}];if(!vd(ds))return[{json:{action:'send',to:from,text:M.badDate}}];if(!vdt(ds,ts))return[{json:{action:'send',to:from,text:M.badTime}}];const sc=toSched(ds,ts);fl.destinataire=num;fl.date=ds;fl.heure=ts;fl.message=mp.join(' ');fl.scheduledAtUtc=sc.utc;fl.scheduledLocal=sc.local;user.etape=4;user.flux=fl;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.askPre}}];}if(/^[0-9]{8,15}$/.test(rawText)){fl.destinataire=rawText;user.etape=1;user.flux=fl;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.askDate}}];}return[{json:{action:'send',to:from,text:M.badNum}}];}if(user.etape===1){if(!vd(rawText))return[{json:{action:'send',to:from,text:M.badDate}}];fl.date=rawText;user.etape=2;user.flux=fl;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.askTime}}];}if(user.etape===2){if(!vdt(fl.date,rawText))return[{json:{action:'send',to:from,text:M.badTime}}];const sc=toSched(fl.date,rawText);fl.heure=rawText;fl.scheduledAtUtc=sc.utc;fl.scheduledLocal=sc.local;user.etape=3;user.flux=fl;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.askMsg}}];}if(user.etape===3){if(fl.pendingTranscription){if(isOui){fl.message=fl.pendingTranscription;fl.pendingTranscription=null;}else if(isNon){fl.pendingTranscription=null;user.flux=fl;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:'Send a message or voice note.'}}];}else{fl.message=rawText;fl.pendingTranscription=null;}}else{fl.message=rawText;}user.etape=4;user.flux=fl;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.askPre}}];}if(user.etape===4){if(msgText==='1'){fl.premessageType='default';user.etape=6;}else if(msgText==='2'){fl.premessageType='none';user.etape=6;}else if(msgText==='3'){user.etape=5;user.flux=fl;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.askCustom}}];}else return[{json:{action:'send',to:from,text:M.badPre}}];user.flux=fl;sd.utilisateurs[from]=user;const pre=fl.premessageType==='none'?M.warnNone+'\\n\\n':'';return[{json:{action:'send',to:from,text:pre+M.confirm(fl)}}];}if(user.etape===5){fl.premessageType='custom';fl.customPremessage=rawText;user.etape=6;user.flux=fl;sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.confirm(fl)}}];}if(user.etape===6){if(!isOui){user.etape=0;user.flux={};sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.cancelled}}];}const id='msg_'+Date.now()+'_'+Math.random().toString(36).substr(2,4);const nm={id,destinataire:fl.destinataire,timezone:TZ,scheduledAtUtc:fl.scheduledAtUtc,scheduledLocal:fl.scheduledLocal,message:fl.message,premessageType:fl.premessageType,customPremessage:fl.customPremessage??null,status:'pending',retryCount:0,nextRetryAtUtc:null,sendingStartedAt:null,sendAttemptId:null,wahaMessageId:null,lastError:null,createdAt:new Date().toISOString(),updatedAt:new Date().toISOString(),sentAt:null};sd.messages.push(nm);user.etape=0;user.flux={};sd.utilisateurs[from]=user;return[{json:{action:'send',to:from,text:M.saved(id)}}];}return[{json:{action:'send',to:from,text:'Type /help for help.'}}];" }
+      "position": [
+        1700,
+        560
+      ],
+      "parameters": {
+        "jsCode": "const { action, from, rawText, msgText, user, n } = $json;\nconst fl = user?.flux ?? {};\nconst TZ = process.env.TZ ?? 'UTC';\nconst { DateTime } = require('luxon');\n\n// Messages loaded from PostgreSQL by the previous node\nconst messages = $('PG Read Messages').all().map(i => i.json);\n\nconst M = {\n  askDate:      'Number ok. Send date (ex: 20/05/2026)',\n  askTime:      'Date ok. Send time (ex: 14:30)',\n  askMsg:       'Time ok. Send your message (text or voice note)',\n  askPre:       'Message received.\\n1=Default pre-message\\n2=None\\n3=Custom',\n  askCustom:    'Write your pre-message:',\n  confirm:      (f) => 'Confirm?\\n📍 ' + f.destinataire + '\\n🕒 ' + f.scheduledLocal + '\\n💬 \"' + f.message + '\"\\n\\nyes / no',\n  saved:        (id) => 'Scheduled! Ref: ' + id + '\\n/list to view',\n  badNum:       'Invalid number. Ex: 33612345678',\n  badDate:      'Invalid or past date. Ex: 20/05/2026',\n  badTime:      'Invalid or past time. Ex: 14:30',\n  badPre:       'Reply 1, 2 or 3',\n  warnNone:     'Recipient will receive the message without any context.',\n  cancelled:    'Flow cancelled.',\n  noMsgs:       'No scheduled messages.',\n  notFound:     'Message not found.',\n  notCancel:    'Message already sent.',\n  deleted:      'Message deleted.',\n  deletedAll:   'All messages deleted.',\n  confirmDel:    (id) => 'Delete ' + id + '?\\nyes / no',\n  confirmDelAll: 'Delete ALL messages?\\nyes / no',\n  editMenu:     'What to edit?\\n1=Number 2=Date+Time 3=Message 4=Pre-message',\n  help: 'Commands: /list  /view [n]  /edit [n]  /cancel [n]  /help\\n\\n' +\n        'Schedule a message:\\n' +\n        '  Send the recipient number, then follow the prompts:\\n' +\n        '  → date (ex: 25/05/2026)\\n' +\n        '  → time (ex: 14:30)\\n' +\n        '  → your message (text or voice note)\\n' +\n        '  → pre-message (1=default  2=none  3=custom)\\n' +\n        '  → confirm with yes\\n\\n' +\n        '  Shortcut — send all at once:\\n' +\n        '  33612345678\\n' +\n        '  25/05/2026\\n' +\n        '  14:30\\n' +\n        '  Your message here\\n\\n' +\n        'Voice notes → instant transcription by Gemini.\\n' +\n        'Timeout: 30 min of inactivity resets the flow.'\n};\n\nfunction pd(s) {\n  if (/^\\d{2}\\/\\d{2}\\/\\d{4}$/.test(s)) return DateTime.fromFormat(s, 'dd/MM/yyyy', { zone: TZ });\n  if (/^\\d{4}-\\d{2}-\\d{2}$/.test(s)) return DateTime.fromFormat(s, 'yyyy-MM-dd', { zone: TZ });\n  return null;\n}\nfunction vd(s) { const d = pd(s); return d?.isValid && d >= DateTime.now().setZone(TZ).startOf('day'); }\nfunction vdt(ds, ts) {\n  const d = pd(ds); if (!d?.isValid) return false;\n  const [h, m] = ts.split(':').map(Number);\n  if (isNaN(h) || isNaN(m) || h > 23 || m > 59) return false;\n  return d.set({ hour: h, minute: m }) > DateTime.now().setZone(TZ);\n}\nfunction toSched(ds, ts) {\n  const d = pd(ds); const [h, m] = ts.split(':').map(Number);\n  const full = d.set({ hour: h, minute: m, second: 0 });\n  return { utc: full.toUTC().toISO(), local: full.toFormat('dd/MM/yyyy') + ' at ' + ts + ' (' + TZ + ')' };\n}\n\nconst isOui = msgText === 'yes';\nconst isNon = msgText === 'no';\n\nconst toDbUser = (u) => ({\n  phone: from,\n  step:  u.etape,\n  draft: u.flux ?? {},\n  flags: {\n    previousEtape:   u.previousEtape,\n    pendingCmd:      u.pendingCmd,\n    pendingCancelId: u.pendingCancelId,\n    pendingCancelAll:u.pendingCancelAll,\n    editingMsgId:    u.editingMsgId,\n    editingField:    u.editingField,\n    editingDateVal:  u.editingDateVal\n  }\n});\n\nconst out = (text, db_msg = null) => [{\n  json: { action: 'send', to: from, text, _db_user: toDbUser(user), _db_msg: db_msg }\n}];\n\n// ── CRUD commands ──────────────────────────────────────────────────────────────\n\nif (action === 'aide') return out(M.help);\n\nif (action === 'crud_liste') {\n  const ms = messages.filter(r => ['pending', 'sending'].includes(r.status));\n  if (!ms.length) return out(M.noMsgs);\n  const list = ms.map((r, i) =>\n    '#' + (i + 1) + ' ' + r.id.substring(0, 18) +\n    '\\n ' + r.destinataire + ' | 🕒 ' + r.scheduled_local + ' | ' + r.status\n  ).join('\\n\\n');\n  return out('📋 ' + list + '\\n\\n/view /edit /cancel');\n}\n\nif (action === 'crud_voir') {\n  const r = messages.find(r => n ? r.id.includes(String(n)) : false);\n  if (!r) return out(M.notFound);\n  return out('📋 ' + r.id + '\\n📍 ' + r.destinataire + '\\n🕒 ' + r.scheduled_local + '\\n💬 \"' + r.message + '\"\\nStatus: ' + r.status);\n}\n\nif (action === 'crud_cancel') {\n  const r = messages.find(r => n ? r.id.includes(String(n)) : false);\n  if (!r) return out(M.notFound);\n  if (r.status === 'sent') return out(M.notCancel);\n  user.pendingCancelId = r.id;\n  return out(M.confirmDel(r.id.substring(0, 18)));\n}\n\nif (action === 'crud_cancel_all') {\n  user.pendingCancelAll = true;\n  return out(M.confirmDelAll);\n}\n\nif (action === 'crud_edit') {\n  const r = messages.find(r => n ? r.id.includes(String(n)) : false);\n  if (!r) return out(M.notFound);\n  user.editingMsgId = r.id; user.editingField = null; user.editingDateVal = null;\n  return out(M.editMenu);\n}\n\n// ── Pending confirmations ──────────────────────────────────────────────────────\n\nif (user.pendingCancelId && (isOui || isNon)) {\n  const cid = user.pendingCancelId; user.pendingCancelId = null;\n  if (isOui) return out(M.deleted, { op: 'cancel', id: cid });\n  return out('OK.');\n}\n\nif (user.pendingCancelAll && (isOui || isNon)) {\n  user.pendingCancelAll = false;\n  if (isOui) return out(M.deletedAll, { op: 'cancel_all', owner: from });\n  return out('OK.');\n}\n\n// ── Edit field selection ───────────────────────────────────────────────────────\n\nif (user.editingMsgId && !user.editingField) {\n  const choice = parseInt(msgText);\n  if ([1, 2, 3, 4].includes(choice)) {\n    user.editingField = ['destinataire', 'datetime', 'message', 'premessage_type'][choice - 1];\n    const ask = [\n      'New number:',\n      'New date and time (ex: 20/05/2026 14:30):',\n      'New message:',\n      'Pre-message (1=default 2=none 3=custom):'\n    ][choice - 1];\n    return out(ask);\n  }\n  user.editingMsgId = null;\n  return out('Cancelled.');\n}\n\nif (user.editingMsgId && user.editingField) {\n  const r = messages.find(r => r.id === user.editingMsgId);\n  if (!r) { user.editingMsgId = null; user.editingField = null; return out(M.notFound); }\n\n  const f = user.editingField;\n  let updateFields = {};\n\n  if (f === 'destinataire') {\n    if (!/^[0-9]{8,15}$/.test(rawText)) return out(M.badNum);\n    updateFields.destinataire = rawText;\n  } else if (f === 'datetime') {\n    const parts = rawText.trim().split(/\\s+/);\n    if (parts.length < 2) return out('Send date and time together (ex: 20/05/2026 14:30)');\n    const [ds, ts] = parts;\n    if (!vd(ds)) return out(M.badDate);\n    if (!vdt(ds, ts)) return out(M.badTime);\n    const sc = toSched(ds, ts);\n    updateFields.scheduled_at = sc.utc;\n    updateFields.scheduled_local = sc.local;\n  } else if (f === 'message') {\n    updateFields.message = rawText;\n  } else if (f === 'premessage_type') {\n    if (msgText === '1') updateFields.premessage_type = 'default';\n    else if (msgText === '2') updateFields.premessage_type = 'none';\n    else if (msgText === '3') updateFields.premessage_type = 'custom';\n    else return out(M.badPre);\n  }\n\n  user.editingMsgId = null; user.editingField = null; user.editingDateVal = null;\n  const db_msg = Object.keys(updateFields).length ? { op: 'update', id: r.id, fields: updateFields } : null;\n  return out('Modified!', db_msg);\n}\n\n// ── Scheduling flow ────────────────────────────────────────────────────────────\n\nif (user.etape === 0) {\n  const lines = rawText.split('\\n').map(s => s.trim()).filter(Boolean);\n  if (lines.length >= 4) {\n    const [num, ds, ts, ...mp] = lines;\n    if (!/^[0-9]{8,15}$/.test(num)) return out(M.badNum);\n    if (!vd(ds)) return out(M.badDate);\n    if (!vdt(ds, ts)) return out(M.badTime);\n    const sc = toSched(ds, ts);\n    fl.destinataire = num; fl.date = ds; fl.heure = ts; fl.message = mp.join(' ');\n    fl.scheduledAtUtc = sc.utc; fl.scheduledLocal = sc.local;\n    user.etape = 4; user.flux = fl;\n    return out(M.askPre);\n  }\n  if (/^[0-9]{8,15}$/.test(rawText)) {\n    fl.destinataire = rawText; user.etape = 1; user.flux = fl;\n    return out(M.askDate);\n  }\n  return out(M.badNum);\n}\n\nif (user.etape === 1) {\n  if (!vd(rawText)) return out(M.badDate);\n  fl.date = rawText; user.etape = 2; user.flux = fl;\n  return out(M.askTime);\n}\n\nif (user.etape === 2) {\n  if (!vdt(fl.date, rawText)) return out(M.badTime);\n  const sc = toSched(fl.date, rawText);\n  fl.heure = rawText; fl.scheduledAtUtc = sc.utc; fl.scheduledLocal = sc.local;\n  user.etape = 3; user.flux = fl;\n  return out(M.askMsg);\n}\n\nif (user.etape === 3) {\n  if (fl.pendingTranscription) {\n    if (isOui)      { fl.message = fl.pendingTranscription; fl.pendingTranscription = null; }\n    else if (isNon) {\n      fl.pendingTranscription = null; user.flux = fl;\n      return out('Send a message or voice note.');\n    } else { fl.message = rawText; fl.pendingTranscription = null; }\n  } else { fl.message = rawText; }\n  user.etape = 4; user.flux = fl;\n  return out(M.askPre);\n}\n\nif (user.etape === 4) {\n  if      (msgText === '1') { fl.premessageType = 'default'; user.etape = 6; }\n  else if (msgText === '2') { fl.premessageType = 'none';    user.etape = 6; }\n  else if (msgText === '3') { user.etape = 5; user.flux = fl; return out(M.askCustom); }\n  else return out(M.badPre);\n  user.flux = fl;\n  const pre = fl.premessageType === 'none' ? M.warnNone + '\\n\\n' : '';\n  return out(pre + M.confirm(fl));\n}\n\nif (user.etape === 5) {\n  fl.premessageType = 'custom'; fl.customPremessage = rawText;\n  user.etape = 6; user.flux = fl;\n  return out(M.confirm(fl));\n}\n\nif (user.etape === 6) {\n  if (!isOui) {\n    user.etape = 0; user.flux = {};\n    return out(M.cancelled);\n  }\n  const id = 'msg_' + Date.now() + '_' + Math.random().toString(36).substr(2, 4);\n  user.etape = 0; user.flux = {};\n  return out(M.saved(id), {\n    op: 'insert',\n    data: {\n      id, owner: from, destinataire: fl.destinataire, timezone: TZ,\n      scheduledAtUtc: fl.scheduledAtUtc, scheduledLocal: fl.scheduledLocal,\n      message: fl.message, premessageType: fl.premessageType,\n      customPremessage: fl.customPremessage ?? null\n    }\n  });\n}\n\nreturn out('Type /help for help.');\n"
+      }
+    },
+    {
+      "id": "n_pguc",
+      "name": "PG Save User CRUD",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1900,
+        480
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO bot_user_state (phone, step, draft, flags, last_activity) VALUES ($1,$2,$3::jsonb,$4::jsonb,NOW()) ON CONFLICT (phone) DO UPDATE SET step=EXCLUDED.step, draft=EXCLUDED.draft, flags=EXCLUDED.flags, last_activity=NOW()",
+        "options": {
+          "queryReplacement": "={{ [$('Flux CRUD Handler').first().json._db_user.phone, $('Flux CRUD Handler').first().json._db_user.step, JSON.stringify($('Flux CRUD Handler').first().json._db_user.draft), JSON.stringify($('Flux CRUD Handler').first().json._db_user.flags)] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      },
+      "continueOnFail": true
+    },
+    {
+      "id": "n_bms",
+      "name": "Build Msg SQL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1900,
+        640
+      ],
+      "parameters": {
+        "jsCode": "// Converts _db_msg from Flux CRUD Handler into a { query, params } pair for\n// the downstream Postgres executeQuery node. Returns [] when no operation needed.\nconst { _db_msg } = $('Flux CRUD Handler').first().json;\nif (!_db_msg) return [];\n\nconst now = new Date().toISOString();\nlet query, params;\n\nif (_db_msg.op === 'insert') {\n  const d = _db_msg.data;\n  query = `INSERT INTO bot_messages\n    (id, owner, destinataire, timezone, scheduled_at, scheduled_local,\n     message, premessage_type, custom_premessage, status, retry_count, created_at, updated_at)\n    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,'pending',0,$10,$10)\n    ON CONFLICT (id) DO NOTHING`;\n  params = [\n    d.id, d.owner, d.destinataire, d.timezone,\n    d.scheduledAtUtc, d.scheduledLocal,\n    d.message, d.premessageType, d.customPremessage ?? null, now\n  ];\n\n} else if (_db_msg.op === 'cancel') {\n  query  = `UPDATE bot_messages SET status='cancelled', updated_at=$2 WHERE id=$1`;\n  params = [_db_msg.id, now];\n\n} else if (_db_msg.op === 'cancel_all') {\n  query  = `UPDATE bot_messages SET status='cancelled', updated_at=$1\n            WHERE owner=$2 AND status IN ('pending','sending')`;\n  params = [now, _db_msg.owner];\n\n} else if (_db_msg.op === 'update') {\n  const keys = Object.keys(_db_msg.fields);\n  const sets = keys.map((k, i) => `${k}=$${i + 2}`).join(', ');\n  query  = `UPDATE bot_messages SET ${sets}, updated_at=$${keys.length + 2} WHERE id=$1`;\n  params = [_db_msg.id, ...Object.values(_db_msg.fields), now];\n\n} else {\n  return [];\n}\n\nreturn [{ json: { query, params } }];\n"
+      }
+    },
+    {
+      "id": "n_pgmop",
+      "name": "PG Execute Msg Op",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2100,
+        640
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "={{ $json.query }}",
+        "options": {
+          "queryReplacement": "={{ $json.params }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      },
+      "continueOnFail": true
     },
     {
       "id": "n_sr",
       "name": "Send Response",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [1900, 300],
+      "position": [
+        1900,
+        560
+      ],
       "parameters": {
         "method": "POST",
         "url": "http://waha:3000/api/default/sendText",
         "sendHeaders": true,
-        "headerParameters": { "parameters": [{ "name": "X-Api-Key", "value": "={{$env.WAHA_API_KEY}}" }] },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.WAHA_API_KEY}}"
+            }
+          ]
+        },
         "sendBody": true,
         "contentType": "json",
-        "body": "={\"chatId\":\"{{$json.to}}@s.whatsapp.net\",\"text\":\"{{$json.text}}\"}",
-        "options": { "timeout": 15000 },
+        "body": "={\"chatId\":\"{{$('Flux CRUD Handler').first().json.to}}@s.whatsapp.net\",\"text\":\"{{$('Flux CRUD Handler').first().json.text}}\"}",
+        "options": {
+          "timeout": 15000
+        },
         "continueOnFail": true
       }
     }
   ],
   "connections": {
-    "Webhook WAHA":      { "main": [[{ "node": "Init Security",     "type": "main", "index": 0 }]] },
-    "Init Security":     { "main": [[{ "node": "Switch Type",       "type": "main", "index": 0 }]] },
-    "Switch Type":       { "main": [
-      [{ "node": "Audio Handler",    "type": "main", "index": 0 }],
-      [{ "node": "Text Handler",     "type": "main", "index": 0 }]
-    ]},
-    "Audio Handler":     { "main": [[{ "node": "Download Audio",    "type": "main", "index": 0 }]] },
-    "Download Audio":    { "main": [[{ "node": "Extract Base64",    "type": "main", "index": 0 }]] },
-    "Extract Base64":    { "main": [[{ "node": "Gemini Transcribe", "type": "main", "index": 0 }]] },
-    "Gemini Transcribe": { "main": [[{ "node": "Delete Audio",      "type": "main", "index": 0 }]] },
-    "Delete Audio":      { "main": [[{ "node": "Gemini Result",     "type": "main", "index": 0 }]] },
-    "Gemini Result":     { "main": [[{ "node": "Send Response",     "type": "main", "index": 0 }]] },
-    "Text Handler":      { "main": [[{ "node": "Flux CRUD Handler", "type": "main", "index": 0 }]] },
-    "Flux CRUD Handler": { "main": [[{ "node": "Send Response",     "type": "main", "index": 0 }]] }
+    "Webhook WAHA": {
+      "main": [
+        [
+          {
+            "node": "Init Security",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Init Security": {
+      "main": [
+        [
+          {
+            "node": "PG Read User State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Read User State": {
+      "main": [
+        [
+          {
+            "node": "Merge Context",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Context": {
+      "main": [
+        [
+          {
+            "node": "Switch Entry",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Entry": {
+      "main": [
+        [
+          {
+            "node": "PG Save User Early",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audio Handler",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Text Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Save User Early": {
+      "main": [
+        [
+          {
+            "node": "Send Response Early",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audio Handler": {
+      "main": [
+        [
+          {
+            "node": "Download Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Download Audio": {
+      "main": [
+        [
+          {
+            "node": "Extract Base64",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Base64": {
+      "main": [
+        [
+          {
+            "node": "Gemini Transcribe",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Transcribe": {
+      "main": [
+        [
+          {
+            "node": "Delete Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Audio": {
+      "main": [
+        [
+          {
+            "node": "Gemini Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gemini Result": {
+      "main": [
+        [
+          {
+            "node": "PG Save User Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Save User Audio": {
+      "main": [
+        [
+          {
+            "node": "Send Response Audio",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Text Handler": {
+      "main": [
+        [
+          {
+            "node": "Switch Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Text": {
+      "main": [
+        [
+          {
+            "node": "PG Save User Text Early",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PG Read Messages",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Save User Text Early": {
+      "main": [
+        [
+          {
+            "node": "Send Response Text Early",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Read Messages": {
+      "main": [
+        [
+          {
+            "node": "Flux CRUD Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flux CRUD Handler": {
+      "main": [
+        [
+          {
+            "node": "PG Save User CRUD",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Msg SQL",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Send Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Msg SQL": {
+      "main": [
+        [
+          {
+            "node": "PG Execute Msg Op",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   }
 }

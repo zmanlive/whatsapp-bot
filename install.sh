@@ -1,5 +1,5 @@
 #!/bin/bash
-# install.sh — WhatsApp Bot v5.0
+# install.sh — WhatsApp Bot v6.0
 # n8n 1.70.0 + WAHA 2024.12 + Gemini AI + Caddy 2.8 + PostgreSQL 16
 set -euo pipefail
 
@@ -22,7 +22,7 @@ echo "  ██║ █╗ ██║███████║███████�
 echo "  ╚████╔╝ ██╔══██║██╔══██║   ██║   ╚════██║██╔══██║██╔═══╝ ██╔═══╝       ██╔══██╗██║   ██║   ██║   "
 echo "   ╚═══╝  ██║  ██║██║  ██║   ██║   ███████║██║  ██║██║     ██║    ██╗     ██████╔╝╚██████╔╝   ██║   "
 echo ""
-echo -e "                           v5.0 — Ubuntu — n8n + WAHA + Gemini + PostgreSQL${NC}"
+echo -e "                           v6.0 — Ubuntu — n8n + WAHA + Gemini + PostgreSQL${NC}"
 echo ""
 
 # ════════════════════════════════════════════════════════════
@@ -263,6 +263,7 @@ log "Copying workflow files..."
 cp "$REPO_DIR/workflows/workflow-receiver.json" "$DIR/workflows/"
 cp "$REPO_DIR/workflows/workflow-guardian.json" "$DIR/workflows/"
 cp "$REPO_DIR/scripts/insert-workflows.sh"      "$DIR/"
+cp "$REPO_DIR/sql/schema.sql"                   "$DIR/"
 chmod +x "$DIR/insert-workflows.sh"
 ok "Workflow JSONs and scripts copied"
 
@@ -333,8 +334,11 @@ echo "N8N_API_KEY=${N8N_API_KEY}" >> .env
 ok "n8n API key saved"
 
 # ════════════════════════════════════════════════════════════
-# SECTION 10 — IMPORTING WORKFLOWS
+# SECTION 10 — BOT TABLES + IMPORTING WORKFLOWS
 # ════════════════════════════════════════════════════════════
+log "Creating bot tables in PostgreSQL..."
+docker exec -i postgres psql -U n8n -d n8n < "$DIR/schema.sql" && ok "Bot tables ready" || warn "Table creation failed — check manually"
+
 log "Importing n8n workflows..."
 bash "$DIR/insert-workflows.sh" "$N8N_API_KEY"
 ok "Workflows imported and activated"
@@ -344,7 +348,7 @@ ok "Workflows imported and activated"
 # ════════════════════════════════════════════════════════════
 echo ""
 echo -e "${GRN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GRN}  INSTALLATION COMPLETED — v5.0${NC}"
+echo -e "${GRN}  INSTALLATION COMPLETED — v6.0${NC}"
 echo -e "${GRN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 
@@ -372,7 +376,7 @@ echo -e "  ${YEL}  4. Status must switch to WORKING${NC}"
 echo ""
 
 cat > "$DIR/INSTALL_INFO.txt" <<INFO
-WhatsApp Bot v5.0 Installation
+WhatsApp Bot v6.0 Installation
 Date: $(date)
 IP  : ${IP}
 $([ -n "$DOMAIN" ] && echo "Domain: ${DOMAIN}" || echo "Direct access: http://${IP}:3000")

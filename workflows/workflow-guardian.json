@@ -1,39 +1,91 @@
 {
   "name": "WA Bot - Guardian",
   "active": true,
-  "settings": { "executionOrder": "v1" },
+  "settings": {
+    "executionOrder": "v1"
+  },
   "nodes": [
     {
       "id": "g_sc",
       "name": "Schedule",
       "type": "n8n-nodes-base.scheduleTrigger",
       "typeVersion": 1.1,
-      "position": [100, 300],
-      "parameters": { "rule": { "interval": [{ "field": "minutes", "minutesInterval": 1 }] } }
+      "position": [
+        100,
+        300
+      ],
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "g_pg",
+      "name": "PG Recover And Select",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        300,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH recovery AS (UPDATE bot_messages SET status='pending', sending_started_at=NULL, next_retry_at=(NOW() + INTERVAL '2 minutes'), last_error=COALESCE(last_error||' [recovery]','[recovery]'), updated_at=NOW() WHERE status='sending' AND sending_started_at < NOW() - INTERVAL '5 minutes') UPDATE bot_messages SET status='sending', sending_started_at=NOW(), send_attempt_id='att_'||EXTRACT(epoch FROM NOW())::bigint||'_'||id, updated_at=NOW() WHERE status='pending' AND scheduled_at <= NOW() AND (next_retry_at IS NULL OR next_retry_at <= NOW()) RETURNING *",
+        "options": {}
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      }
     },
     {
       "id": "g_gl",
       "name": "Guardian Logic",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [300, 300],
-      "parameters": { "jsCode": "const sd=$getWorkflowStaticData('global');sd.messages=sd.messages??[];const now=Date.now();const cfg=sd.config??{};sd.messages.forEach(msg=>{if(msg.status==='sending'&&msg.sendingStartedAt&&now-new Date(msg.sendingStartedAt).getTime()>5*60*1000){msg.status='pending';msg.sendingStartedAt=null;msg.nextRetryAtUtc=new Date(now+2*60*1000).toISOString();msg.lastError=(msg.lastError??'')+' [recovery]';msg.updatedAt=new Date(now).toISOString();}});const toSend=sd.messages.filter(msg=>msg.status==='pending'&&new Date(msg.scheduledAtUtc).getTime()<=now&&(!msg.nextRetryAtUtc||new Date(msg.nextRetryAtUtc).getTime()<=now));if(!toSend.length)return[];const att='att_'+now;toSend.forEach(msg=>{msg.status='sending';msg.sendingStartedAt=new Date(now).toISOString();msg.sendAttemptId=att+'_'+msg.id;msg.updatedAt=new Date(now).toISOString();});const PREMSG=cfg.premessageDefaut??process.env.DEFAULT_PREMESSAGE??'';const AUTH=cfg.numeroAutorise??process.env.AUTHORIZED_NUMBER??'';return toSend.map(msg=>{let t;if(msg.premessageType==='default')t=PREMSG+'\\n\"'+msg.message+'\"';else if(msg.premessageType==='custom')t=(msg.customPremessage??'')+'\\n\"'+msg.message+'\"';else t=msg.message;return{json:{msgId:msg.id,to:msg.destinataire,text:t,authNum:AUTH}};});" }
+      "position": [
+        500,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Each item is a row from PG Recover+Select (bot_messages WHERE status just set to 'sending')\nconst row = $json;\nconst PREMSG = process.env.DEFAULT_PREMESSAGE ?? '';\nconst AUTH   = process.env.AUTHORIZED_NUMBER  ?? '';\n\nlet text;\nif (row.premessage_type === 'default')       text = PREMSG + '\\n\"' + row.message + '\"';\nelse if (row.premessage_type === 'custom')   text = (row.custom_premessage ?? '') + '\\n\"' + row.message + '\"';\nelse                                          text = row.message;\n\nreturn [{ json: {\n  msgId:          row.id,\n  to:             row.destinataire,\n  text,\n  authNum:        AUTH,\n  scheduledLocal: row.scheduled_local,\n  destinataire:   row.destinataire,\n  retryCount:     row.retry_count ?? 0\n} }];\n"
+      }
     },
     {
       "id": "g_hs",
       "name": "HTTP Send WAHA",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [500, 300],
+      "position": [
+        700,
+        300
+      ],
       "parameters": {
         "method": "POST",
         "url": "http://waha:3000/api/default/sendText",
         "sendHeaders": true,
-        "headerParameters": { "parameters": [{ "name": "X-Api-Key", "value": "={{$env.WAHA_API_KEY}}" }] },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.WAHA_API_KEY}}"
+            }
+          ]
+        },
         "sendBody": true,
         "contentType": "json",
         "body": "={\"chatId\":\"{{$json.to}}@s.whatsapp.net\",\"text\":\"{{$json.text}}\"}",
-        "options": { "timeout": 15000 }
+        "options": {
+          "timeout": 15000
+        }
       }
     },
     {
@@ -41,32 +93,135 @@
       "name": "Process Result",
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
-      "position": [700, 300],
-      "parameters": { "jsCode": "const sd=$getWorkflowStaticData('global');const guardianItems=$('Guardian Logic').all();const wahaResp=$input.first().json??{};const src=guardianItems[$itemIndex]?.json??{};const msgId=src.msgId;const authNum=src.authNum;const now=new Date().toISOString();const msg=(sd.messages??[]).find(m=>m.id===msgId);if(!msg)return[{json:{action:'notify',to:authNum,text:'[log] not found: '+msgId}}];const wahaId=wahaResp?.id??wahaResp?.key?.id??null;if(wahaId){msg.status='sent';msg.wahaMessageId=wahaId;msg.sentAt=now;msg.updatedAt=now;msg.sendingStartedAt=null;return[{json:{action:'notify',to:authNum,text:'\\u2705 Message sent!\\n\\uD83D\\uDCCD '+msg.destinataire+'\\n\\uD83D\\uDD52 '+msg.scheduledLocal}}];}msg.retryCount=(msg.retryCount??0)+1;msg.lastError=JSON.stringify(wahaResp).substring(0,300);msg.updatedAt=now;msg.sendingStartedAt=null;if(msg.retryCount>=3){msg.status='failed';return[{json:{action:'notify',to:authNum,text:'\\u274C Failed (3 attempts)\\n\\uD83D\\uDCCD '+msg.destinataire+'\\nError: '+msg.lastError.substring(0,80)}}];}msg.status='pending';msg.nextRetryAtUtc=new Date(Date.now()+2*60*1000).toISOString();return[{json:{action:'notify',to:authNum,text:'[log] Retry #'+msg.retryCount+' for '+msgId}}];" }
+      "position": [
+        900,
+        300
+      ],
+      "parameters": {
+        "jsCode": "const guardianItems = $('Guardian Logic').all();\nconst wahaResp = $input.first().json ?? {};\nconst src      = guardianItems[$itemIndex]?.json ?? {};\nconst msgId    = src.msgId;\nconst authNum  = src.authNum;\nconst now      = new Date().toISOString();\n\nconst wahaId = wahaResp?.id ?? wahaResp?.key?.id ?? null;\n\nif (wahaId) {\n  return [{ json: {\n    action: 'notify', to: authNum,\n    text: '✅ Message sent!\\n📍 ' + src.destinataire + '\\n🕒 ' + src.scheduledLocal,\n    _db_msg: {\n      id: msgId, status: 'sent',\n      waha_message_id: wahaId, sent_at: now,\n      retry_count: src.retryCount,\n      next_retry_at: null, last_error: null, sending_started_at: null\n    }\n  }}];\n}\n\nconst retryCount = (src.retryCount ?? 0) + 1;\nconst lastError  = JSON.stringify(wahaResp).substring(0, 300);\n\nif (retryCount >= 3) {\n  return [{ json: {\n    action: 'notify', to: authNum,\n    text: '❌ Failed (3 attempts)\\n📍 ' + src.destinataire + '\\nError: ' + lastError.substring(0, 80),\n    _db_msg: {\n      id: msgId, status: 'failed',\n      retry_count: retryCount, last_error: lastError,\n      next_retry_at: null, sending_started_at: null,\n      waha_message_id: null, sent_at: null\n    }\n  }}];\n}\n\nreturn [{ json: {\n  action: 'notify', to: authNum,\n  text: '[log] Retry #' + retryCount + ' for ' + msgId,\n  _db_msg: {\n    id: msgId, status: 'pending',\n    retry_count: retryCount, last_error: lastError,\n    next_retry_at: new Date(Date.now() + 2 * 60 * 1000).toISOString(),\n    sending_started_at: null,\n    waha_message_id: null, sent_at: null\n  }\n}}];\n"
+      }
+    },
+    {
+      "id": "g_pgup",
+      "name": "PG Update Message",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "UPDATE bot_messages SET status=$2, waha_message_id=$3, sent_at=$4, retry_count=$5, next_retry_at=$6, last_error=$7, sending_started_at=$8, updated_at=NOW() WHERE id=$1",
+        "options": {
+          "queryReplacement": "={{ [$json._db_msg.id, $json._db_msg.status, $json._db_msg.waha_message_id ?? null, $json._db_msg.sent_at ?? null, $json._db_msg.retry_count, $json._db_msg.next_retry_at ?? null, $json._db_msg.last_error ?? null, $json._db_msg.sending_started_at ?? null] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "CRED_ID_PLACEHOLDER",
+          "name": "Bot PostgreSQL"
+        }
+      },
+      "continueOnFail": true
     },
     {
       "id": "g_nt",
       "name": "Send Notification",
       "type": "n8n-nodes-base.httpRequest",
       "typeVersion": 4,
-      "position": [900, 300],
+      "position": [
+        1300,
+        300
+      ],
       "parameters": {
         "method": "POST",
         "url": "http://waha:3000/api/default/sendText",
         "sendHeaders": true,
-        "headerParameters": { "parameters": [{ "name": "X-Api-Key", "value": "={{$env.WAHA_API_KEY}}" }] },
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Api-Key",
+              "value": "={{$env.WAHA_API_KEY}}"
+            }
+          ]
+        },
         "sendBody": true,
         "contentType": "json",
-        "body": "={\"chatId\":\"{{$json.to}}@s.whatsapp.net\",\"text\":\"{{$json.text}}\"}",
-        "options": { "timeout": 10000 },
+        "body": "={\"chatId\":\"{{$('Process Result').first().json.to}}@s.whatsapp.net\",\"text\":\"{{$('Process Result').first().json.text}}\"}",
+        "options": {
+          "timeout": 10000
+        },
         "continueOnFail": true
       }
     }
   ],
   "connections": {
-    "Schedule":       { "main": [[{ "node": "Guardian Logic",    "type": "main", "index": 0 }]] },
-    "Guardian Logic": { "main": [[{ "node": "HTTP Send WAHA",    "type": "main", "index": 0 }]] },
-    "HTTP Send WAHA": { "main": [[{ "node": "Process Result",    "type": "main", "index": 0 }]] },
-    "Process Result": { "main": [[{ "node": "Send Notification", "type": "main", "index": 0 }]] }
+    "Schedule": {
+      "main": [
+        [
+          {
+            "node": "PG Recover And Select",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Recover And Select": {
+      "main": [
+        [
+          {
+            "node": "Guardian Logic",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Guardian Logic": {
+      "main": [
+        [
+          {
+            "node": "HTTP Send WAHA",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "HTTP Send WAHA": {
+      "main": [
+        [
+          {
+            "node": "Process Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Process Result": {
+      "main": [
+        [
+          {
+            "node": "PG Update Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG Update Message": {
+      "main": [
+        [
+          {
+            "node": "Send Notification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
   }
 }

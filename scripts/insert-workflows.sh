@@ -1,5 +1,5 @@
 #!/bin/bash
-# insert-workflows.sh — Imports pre-built workflow JSONs into n8n.
+# insert-workflows.sh — Creates Postgres credential then imports pre-built workflow JSONs into n8n.
 set -euo pipefail
 
 N8N_KEY="${1:-}"
@@ -7,6 +7,9 @@ N8N_KEY="${1:-}"
 
 BASE="http://localhost:5678"
 WORKFLOWS_DIR="/opt/waha-bot/workflows"
+
+# Load env to get POSTGRES_PASSWORD
+[ -f /opt/waha-bot/.env ] && source /opt/waha-bot/.env
 
 echo "[wf] Waiting for n8n API..."
 for i in $(seq 1 15); do
@@ -16,6 +19,47 @@ for i in $(seq 1 15); do
   [[ $i -eq 15 ]] && { echo "n8n API unreachable (HTTP $CODE)"; exit 1; }
   sleep 3
 done
+
+# ── Postgres credential ────────────────────────────────────────────────────────
+
+echo "[wf] Setting up Postgres credential..."
+
+CRED_ID=$(curl -sf "$BASE/api/v1/credentials" \
+  -H "X-N8N-API-KEY: $N8N_KEY" 2>/dev/null \
+  | python3 -c "
+import sys, json
+d = json.load(sys.stdin)
+m = [str(c['id']) for c in d.get('data', []) if c.get('name') == 'Bot PostgreSQL']
+print(m[0] if m else '')" 2>/dev/null || echo "")
+
+if [[ -z "$CRED_ID" ]]; then
+  CRED_RESP=$(curl -sf -X POST "$BASE/api/v1/credentials" \
+    -H "X-N8N-API-KEY: $N8N_KEY" -H "Content-Type: application/json" \
+    -d "{
+      \"name\": \"Bot PostgreSQL\",
+      \"type\": \"postgres\",
+      \"data\": {
+        \"host\": \"postgres\",
+        \"port\": 5432,
+        \"database\": \"n8n\",
+        \"user\": \"n8n\",
+        \"password\": \"${POSTGRES_PASSWORD}\",
+        \"ssl\": \"disable\"
+      }
+    }" 2>/dev/null)
+  CRED_ID=$(echo "$CRED_RESP" | python3 -c \
+    "import sys, json; print(json.load(sys.stdin).get('id', ''))" 2>/dev/null || echo "")
+  [[ -z "$CRED_ID" ]] && { echo "Failed to create Postgres credential: $(echo "$CRED_RESP" | head -c 200)"; exit 1; }
+  echo "[wf] Credential created (id $CRED_ID)"
+else
+  echo "[wf] Credential already exists (id $CRED_ID)"
+fi
+
+# Inject credential ID into workflow JSONs
+sed -i "s/CRED_ID_PLACEHOLDER/$CRED_ID/g" "$WORKFLOWS_DIR/workflow-receiver.json"
+sed -i "s/CRED_ID_PLACEHOLDER/$CRED_ID/g" "$WORKFLOWS_DIR/workflow-guardian.json"
+
+# ── Workflow import ────────────────────────────────────────────────────────────
 
 upsert_wf() {
   local NAME="$1" FILE="$2"
