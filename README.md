@@ -1,7 +1,7 @@
-# WhatsApp Bot v4.2
+# WhatsApp Bot v5.0
 
 WhatsApp message scheduler + audio transcription.
-Stack: n8n · WAHA · Gemini AI · Caddy · Docker · Ubuntu
+Stack: n8n · WAHA · Gemini AI · PostgreSQL · Caddy · Docker · Ubuntu
 
 ---
 
@@ -107,6 +107,10 @@ If you are scheduling a message, the bot will ask if you want to use the transcr
 
 [n8n Guardian] (every minute)
   └─ pending messages + scheduled time reached → [WAHA] ──► [WhatsApp recipient]
+
+[PostgreSQL]
+  └─ n8n internal database (workflows, credentials, executions)
+     replaces SQLite for reliability and scalability
 ```
 
 ### n8n Workflows
@@ -125,6 +129,7 @@ If you are scheduling a message, the bot will ask if you want to use the transcr
 | [n8n](https://n8n.io) | 1.70.0 | Workflow orchestration |
 | [WAHA](https://waha.devlike.pro) | 2024.12 (NOWEB) | WhatsApp API |
 | [Gemini](https://aistudio.google.com) | 2.0 Flash | Audio transcription |
+| [PostgreSQL](https://www.postgresql.org) | 16 | n8n internal database |
 | [Caddy](https://caddyserver.com) | 2.8 | HTTPS Reverse proxy (optional) |
 
 ---
